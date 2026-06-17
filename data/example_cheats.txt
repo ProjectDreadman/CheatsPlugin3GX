@@ -1,0 +1,47 @@
+*Game: Example Title
+*This file demonstrates every supported code type.
+*Rename this file to <your-title-id>.txt and place it at sdmc:/cheats/
+
+[Infinite HP]
+*Continuous 32-bit write — re-applied every poll tick
+0A123456 000003E7
+
+[Infinite HP (16-bit)]
+*Same idea, but the target value is a 16-bit field
+1A123458 000003E7
+
+[Max Currency]
+*8-bit write example
+2A12345C 000000FF
+
+[Add 100 Score Per Tick]
+*Demonstrates the add-to-memory opcode — value increases continuously
+8A123460 00000064
+
+[Conditional] Only While Paused
+*If-equal gate: only applies the write while the pause flag equals 1
+3A123470 00000001
+0A123474 7FFFFFFF
+B0000000 00000000
+
+[Button Gated] Hold L for Moon Jump
+*94000130 gate: requires L held, requires nothing NOT held
+94000130 00000200
+0A123480 BF800000
+
+[One-shot Set Base Example]
+*D3 sets an alternate base address register before the write that follows
+D3000000 08100000
+0A000010 00000001
+
+[Loop Example] Clear a Table
+*C-type loop: zero out 10 consecutive 32-bit slots
+C0000000 0000000A
+0A123500 00000000
+D0000000 00000000
+
+[Broken Example - Unsupported Opcode]
+*This intentionally uses an opcode (0xE) outside the supported set so the
+*menu will show it greyed out with a "!" marker instead of silently
+*letting you enable something that does nothing (or worse).
+E0000000 00000000
