@@ -1,0 +1,10 @@
+# Build artifacts
+build/
+*.elf
+*.3gx
+*.map
+*.o
+
+# OS junk
+.DS_Store
+Thumbs.db
