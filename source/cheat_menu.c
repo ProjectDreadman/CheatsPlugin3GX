@@ -1,6 +1,21 @@
 // ═══════════════════════════════════════════════════════════════════════════
-//  CustomCheats — In-game Cheat Menu
-//  Bottom-screen overlay drawn via direct framebuffer writes.
+//  CustomCheats — In-game Cheat Menu (framebuffer renderer)
+//
+//  Bottom-screen overlay drawn via direct framebuffer writes. This is the
+//  default, always-safe rendering backend — it never touches the GPU
+//  command queue, so it can't conflict with whatever the game itself is
+//  doing with Citro3D/Citro2D this frame.
+//
+//  Page flow:
+//    Categories  →  List (filtered)  →  Detail
+//                         ↕
+//                      About
+//
+//  A second, optional backend (gui_citro2d.c) renders the exact same
+//  CheatDatabase state using Citro2D for a more polished look; which
+//  backend is active is selected by gui_backend.c based on config.ini
+//  and a runtime safety probe. This file only implements the logic and
+//  the framebuffer drawing — it has no GPU dependency.
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include <3ds.h>
@@ -16,27 +31,60 @@
 // ─────────────────────────────────────────────
 //  State
 // ─────────────────────────────────────────────
-static bool          s_visible    = false;
-static CheatMenuPage s_page       = CM_PAGE_LIST;
-static int           s_scroll     = 0;
-static int           s_cursor     = 0;
-static int           s_detailLine = 0;   // scroll offset for the detail view
+static bool          s_visible     = false;
+static CheatMenuPage s_page        = CM_PAGE_CATEGORIES;
 
-static u8 *s_fb = NULL;
+static int  s_catScroll    = 0;
+static int  s_catCursor    = 0;     // index into a virtual list: 0 = "All Cheats", 1..N = categories
+
+static int  s_listScroll   = 0;
+static int  s_listCursor   = 0;     // index into the FILTERED list, not g_cheats.db.cheats directly
+static s32  s_activeFilter = CM_CATEGORY_ALL;
+
+static int  s_detailLine   = 0;
+
+static u8 *s_fb  = NULL;
 static u32 s_fbW = CM_SCREEN_W;
 static u32 s_fbH = CM_SCREEN_H;
 
 #define ROWS_PER_PAGE 9
 
 // ─────────────────────────────────────────────
+//  Filtered-list helpers
+//
+//  Rather than maintaining a separate filtered array, we keep a small
+//  index map rebuilt whenever the filter or database changes. This
+//  keeps CC_ToggleCheat() working against real database indices while
+//  letting the UI iterate only the cheats that match the current
+//  category filter.
+// ─────────────────────────────────────────────
+static u32 s_filteredIndices[CC_MAX_CHEATS];
+static u32 s_filteredCount = 0;
+
+static void rebuildFilteredList(void) {
+    s_filteredCount = 0;
+    for (u32 i = 0; i < g_cheats.db.cheatCount; i++) {
+        Cheat *c = &g_cheats.db.cheats[i];
+        if (s_activeFilter == CM_CATEGORY_ALL || c->categoryIndex == s_activeFilter) {
+            s_filteredIndices[s_filteredCount++] = i;
+        }
+    }
+    if (s_listCursor >= (int)s_filteredCount) s_listCursor = (s_filteredCount > 0) ? (int)s_filteredCount - 1 : 0;
+    if (s_listScroll > s_listCursor) s_listScroll = s_listCursor;
+}
+
+// ─────────────────────────────────────────────
 //  Init
 // ─────────────────────────────────────────────
 void CM_Init(void) {
-    s_visible    = false;
-    s_page       = CM_PAGE_LIST;
-    s_scroll     = 0;
-    s_cursor     = 0;
-    s_detailLine = 0;
+    s_visible      = false;
+    s_page         = CM_PAGE_CATEGORIES;
+    s_catScroll    = 0;
+    s_catCursor    = 0;
+    s_listScroll   = 0;
+    s_listCursor   = 0;
+    s_activeFilter = CM_CATEGORY_ALL;
+    s_detailLine   = 0;
 }
 
 void CM_Toggle(void) {
@@ -46,6 +94,33 @@ void CM_Toggle(void) {
 
 bool CM_IsVisible(void) {
     return s_visible;
+}
+
+// ─────────────────────────────────────────────
+//  State snapshot for alternate renderers
+// ─────────────────────────────────────────────
+void CM_GetState(CheatMenuState *out) {
+    if (!out) return;
+
+    // Make sure the filtered-list cache reflects the current filter
+    // before handing out a pointer to it (covers the case where the
+    // Citro2D backend renders a frame before the framebuffer path's
+    // own drawPageList() would have refreshed it).
+    if (s_activeFilter != CM_CATEGORY_ALL &&
+        (s_activeFilter < 0 || (u32)s_activeFilter >= g_cheats.db.categoryCount)) {
+        s_activeFilter = CM_CATEGORY_ALL;
+    }
+    rebuildFilteredList();
+
+    out->page           = s_page;
+    out->catScroll       = s_catScroll;
+    out->catCursor       = s_catCursor;
+    out->listScroll      = s_listScroll;
+    out->listCursor      = s_listCursor;
+    out->activeFilter    = s_activeFilter;
+    out->detailLine       = s_detailLine;
+    out->filteredIndices = s_filteredIndices;
+    out->filteredCount   = s_filteredCount;
 }
 
 // ─────────────────────────────────────────────
@@ -114,66 +189,119 @@ static void drawFooter(const char *hint) {
 }
 
 // ─────────────────────────────────────────────
-//  List page
+//  Categories page — entry point
+//
+//  Row 0 is always "All Cheats (N)". Rows 1..categoryCount are the
+//  parsed categories, each showing "Name (enabled/total)". Cheats with
+//  no category never appear here as their own row — they're reachable
+//  only through "All Cheats" — so a flat cheat file with zero [Category]
+//  headers shows a single, uncluttered entry point.
 // ─────────────────────────────────────────────
-static void drawPageList(void) {
-    char header[32];
-    snprintf(header, sizeof(header), "Cheats (%lu)", (unsigned long)g_cheats.db.cheatCount);
-    drawHeader(header);
+static int categoryRowCount(void) {
+    return 1 + (int)g_cheats.db.categoryCount; // +1 for "All Cheats"
+}
+
+static void drawPageCategories(void) {
+    drawHeader("Categories");
 
     if (!g_cheats.db.loaded || g_cheats.db.cheatCount == 0) {
         drawText(8, 60, CM_COL_TEXT, "No cheat file found for this game.");
         drawText(8, 72, CM_COL_TEXT, "Place a file at:");
         drawTextF(8, 84, CM_COL_YELLOW, "/cheats/%016llX.txt",
                   (unsigned long long)g_cheats.db.titleId);
-        drawFooter("L/R: page");
+        drawFooter("X: reload from SD");
+        return;
+    }
+
+    int total = categoryRowCount();
+    int y = 18;
+    int end = s_catScroll + ROWS_PER_PAGE;
+    if (end > total) end = total;
+
+    for (int row = s_catScroll; row < end; row++) {
+        bool selected = (row == s_catCursor);
+        if (selected) drawRect(0, y - 1, CM_SCREEN_W, 10, CM_COL_ACCENT);
+
+        if (row == 0) {
+            drawTextF(8, y, CM_COL_WHITE, "All Cheats (%lu)",
+                       (unsigned long)g_cheats.db.cheatCount);
+        } else {
+            CheatCategory *cat = &g_cheats.db.categories[row - 1];
+            drawTextF(8, y, CM_COL_WHITE, "%s (%lu/%lu)",
+                       cat->name,
+                       (unsigned long)cat->enabledCount,
+                       (unsigned long)cat->cheatCount);
+        }
+        y += 11;
+    }
+
+    drawFooter("A: open  X: reload  Up/Down");
+}
+
+// ─────────────────────────────────────────────
+//  List page — filtered by s_activeFilter
+// ─────────────────────────────────────────────
+static void drawPageList(void) {
+    // A reload can shrink the category table out from under an active
+    // filter; fall back to "All Cheats" rather than reading past the end.
+    if (s_activeFilter != CM_CATEGORY_ALL &&
+        (s_activeFilter < 0 || (u32)s_activeFilter >= g_cheats.db.categoryCount)) {
+        s_activeFilter = CM_CATEGORY_ALL;
+    }
+
+    rebuildFilteredList(); // cheap (≤256 entries); keeps the view correct after a reload
+
+    const char *headerText = (s_activeFilter == CM_CATEGORY_ALL)
+        ? "All Cheats"
+        : g_cheats.db.categories[s_activeFilter].name;
+    drawHeader(headerText);
+
+    if (s_filteredCount == 0) {
+        drawText(8, 60, CM_COL_TEXT, "No cheats in this category.");
+        drawFooter("B: back to categories");
         return;
     }
 
     int y = 18;
-    int end = s_scroll + ROWS_PER_PAGE;
-    if (end > (int)g_cheats.db.cheatCount) end = (int)g_cheats.db.cheatCount;
+    int end = s_listScroll + ROWS_PER_PAGE;
+    if (end > (int)s_filteredCount) end = (int)s_filteredCount;
 
-    for (int i = s_scroll; i < end; i++) {
-        Cheat *c = &g_cheats.db.cheats[i];
-        bool selected = (i == s_cursor);
+    for (int row = s_listScroll; row < end; row++) {
+        u32 realIdx = s_filteredIndices[row];
+        Cheat *c = &g_cheats.db.cheats[realIdx];
+        bool selected = (row == s_listCursor);
 
-        if (selected)
-            drawRect(0, y - 1, CM_SCREEN_W, 10, CM_COL_ACCENT);
+        if (selected) drawRect(0, y - 1, CM_SCREEN_W, 10, CM_COL_ACCENT);
 
         u32 stateCol;
         const char *stateGlyph;
-        if (c->hasError)      { stateCol = CM_COL_GREY;   stateGlyph = "!"; }
-        else if (c->enabled)  { stateCol = CM_COL_GREEN;  stateGlyph = "+"; }
-        else                  { stateCol = CM_COL_RED;    stateGlyph = "-"; }
+        if (c->hasError)      { stateCol = CM_COL_GREY;  stateGlyph = "!"; }
+        else if (c->enabled)  { stateCol = CM_COL_GREEN; stateGlyph = "+"; }
+        else                  { stateCol = CM_COL_RED;   stateGlyph = "-"; }
 
         drawText(4, y, stateCol, stateGlyph);
 
         u32 nameCol = c->hasError ? CM_COL_GREY : CM_COL_WHITE;
         drawText(14, y, nameCol, c->name);
-
-        if (c->category[0]) {
-            int catX = CM_SCREEN_W - (int)(strlen(c->category) * 6) - 30;
-            if (catX > 120) drawText(catX, y, CM_COL_GREY, c->category);
-        }
         y += 11;
     }
 
-    if (g_cheats.db.cheatCount > ROWS_PER_PAGE) {
+    if (s_filteredCount > ROWS_PER_PAGE) {
         drawTextF(CM_SCREEN_W - 34, CM_SCREEN_H - 24, CM_COL_TEXT,
-                  "%d/%lu", s_cursor + 1, (unsigned long)g_cheats.db.cheatCount);
+                  "%d/%lu", s_listCursor + 1, (unsigned long)s_filteredCount);
     }
 
-    drawFooter("A: toggle  X: details  Up/Down/L/R");
+    drawFooter("A: toggle  X: details  B: back");
 }
 
 // ─────────────────────────────────────────────
-//  Detail page — raw codes + note for the selected cheat
+//  Detail page
 // ─────────────────────────────────────────────
 static void drawPageDetail(void) {
-    if (g_cheats.db.cheatCount == 0) { s_page = CM_PAGE_LIST; return; }
+    if (s_filteredCount == 0) { s_page = CM_PAGE_LIST; return; }
 
-    Cheat *c = &g_cheats.db.cheats[s_cursor];
+    u32 realIdx = s_filteredIndices[s_listCursor];
+    Cheat *c = &g_cheats.db.cheats[realIdx];
     drawHeader("Detail");
 
     int y = 18;
@@ -196,7 +324,6 @@ static void drawPageDetail(void) {
     drawRect(8, y, CM_SCREEN_W - 16, 1, CM_COL_ACCENT);
     y += 6;
 
-    // Scrollable code listing
     int visibleRows = (CM_SCREEN_H - 12 - y) / 9;
     int start = s_detailLine;
     int end = start + visibleRows;
@@ -230,8 +357,9 @@ static void drawPageAbout(void) {
     drawText(8, y, CM_COL_TEXT, "Toggle state saved to:");  y += 10;
     drawText(16, y, CM_COL_YELLOW, "/luma/plugins/CustomCheats/"); y += 9;
     drawText(16, y, CM_COL_YELLOW, "  state/<titleid>.ini"); y += 14;
-    drawText(8, y, CM_COL_TEXT, "Hotkey: R + SELECT");
-    drawFooter("L/R: page");
+    drawText(8, y, CM_COL_TEXT, "Hotkey: R + SELECT");  y += 10;
+    drawText(8, y, CM_COL_TEXT, "X on Categories: reload cheats.txt");
+    drawFooter("B: back");
 }
 
 // ─────────────────────────────────────────────
@@ -246,9 +374,10 @@ void CM_Draw(void) {
     drawRect(0, 0, CM_SCREEN_W, CM_SCREEN_H, CM_COL_BG);
 
     switch (s_page) {
-        case CM_PAGE_LIST:   drawPageList();   break;
-        case CM_PAGE_DETAIL: drawPageDetail(); break;
-        case CM_PAGE_ABOUT:  drawPageAbout();  break;
+        case CM_PAGE_CATEGORIES: drawPageCategories(); break;
+        case CM_PAGE_LIST:       drawPageList();       break;
+        case CM_PAGE_DETAIL:     drawPageDetail();      break;
+        case CM_PAGE_ABOUT:      drawPageAbout();        break;
     }
 }
 
@@ -258,47 +387,88 @@ void CM_Draw(void) {
 void CM_HandleInput(u32 kDown, u32 kHeld) {
     (void)kHeld;
 
-    if (s_page == CM_PAGE_LIST) {
-        if (kDown & KEY_R) s_page = CM_PAGE_ABOUT;
-        if (kDown & KEY_L) s_page = CM_PAGE_ABOUT;
+    switch (s_page) {
 
-        if (g_cheats.db.cheatCount > 0) {
+        case CM_PAGE_CATEGORIES: {
+            int total = categoryRowCount();
+
             if (kDown & KEY_DOWN) {
-                if (s_cursor < (int)g_cheats.db.cheatCount - 1) {
-                    s_cursor++;
-                    if (s_cursor >= s_scroll + ROWS_PER_PAGE) s_scroll++;
+                if (s_catCursor < total - 1) {
+                    s_catCursor++;
+                    if (s_catCursor >= s_catScroll + ROWS_PER_PAGE) s_catScroll++;
                 }
             }
             if (kDown & KEY_UP) {
-                if (s_cursor > 0) {
-                    s_cursor--;
-                    if (s_cursor < s_scroll) s_scroll--;
+                if (s_catCursor > 0) {
+                    s_catCursor--;
+                    if (s_catCursor < s_catScroll) s_catScroll--;
                 }
             }
             if (kDown & KEY_A) {
-                CC_ToggleCheat((u32)s_cursor);
+                s_activeFilter = (s_catCursor == 0) ? CM_CATEGORY_ALL : (s32)(s_catCursor - 1);
+                s_listScroll = 0;
+                s_listCursor = 0;
+                rebuildFilteredList();
+                s_page = CM_PAGE_LIST;
             }
             if (kDown & KEY_X) {
-                s_detailLine = 0;
-                s_page = CM_PAGE_DETAIL;
+                // Hot-reload the cheat file from SD without restarting the game
+                CC_ReloadDatabase();
+                s_catCursor = 0;
+                s_catScroll = 0;
             }
+            if (kDown & KEY_Y) {
+                s_page = CM_PAGE_ABOUT;
+            }
+            break;
         }
-    }
-    else if (s_page == CM_PAGE_DETAIL) {
-        Cheat *c = (g_cheats.db.cheatCount > 0) ? &g_cheats.db.cheats[s_cursor] : NULL;
-        if (kDown & KEY_B) s_page = CM_PAGE_LIST;
-        if (c) {
-            if (kDown & KEY_DOWN) {
-                if (s_detailLine < (int)c->lineCount - 1) s_detailLine++;
+
+        case CM_PAGE_LIST: {
+            if (kDown & KEY_B) {
+                s_page = CM_PAGE_CATEGORIES;
+                break;
             }
-            if (kDown & KEY_UP) {
-                if (s_detailLine > 0) s_detailLine--;
+            if (s_filteredCount > 0) {
+                if (kDown & KEY_DOWN) {
+                    if (s_listCursor < (int)s_filteredCount - 1) {
+                        s_listCursor++;
+                        if (s_listCursor >= s_listScroll + ROWS_PER_PAGE) s_listScroll++;
+                    }
+                }
+                if (kDown & KEY_UP) {
+                    if (s_listCursor > 0) {
+                        s_listCursor--;
+                        if (s_listCursor < s_listScroll) s_listScroll--;
+                    }
+                }
+                if (kDown & KEY_A) {
+                    CC_ToggleCheat(s_filteredIndices[s_listCursor]);
+                }
+                if (kDown & KEY_X) {
+                    s_detailLine = 0;
+                    s_page = CM_PAGE_DETAIL;
+                }
             }
+            break;
         }
-    }
-    else if (s_page == CM_PAGE_ABOUT) {
-        if (kDown & KEY_L) s_page = CM_PAGE_LIST;
-        if (kDown & KEY_R) s_page = CM_PAGE_LIST;
-        if (kDown & KEY_B) s_page = CM_PAGE_LIST;
+
+        case CM_PAGE_DETAIL: {
+            if (kDown & KEY_B) { s_page = CM_PAGE_LIST; break; }
+            if (s_filteredCount > 0) {
+                Cheat *c = &g_cheats.db.cheats[s_filteredIndices[s_listCursor]];
+                if (kDown & KEY_DOWN) {
+                    if (s_detailLine < (int)c->lineCount - 1) s_detailLine++;
+                }
+                if (kDown & KEY_UP) {
+                    if (s_detailLine > 0) s_detailLine--;
+                }
+            }
+            break;
+        }
+
+        case CM_PAGE_ABOUT: {
+            if (kDown & (KEY_B | KEY_Y)) s_page = CM_PAGE_CATEGORIES;
+            break;
+        }
     }
 }

@@ -11,6 +11,7 @@
 #include "cheat_engine.h"
 #include "cheat_vm.h"
 #include "cheat_menu.h"
+#include "gui_backend.h"
 
 // ─────────────────────────────────────────────
 //  Version
@@ -213,6 +214,7 @@ static void pluginThread(void *arg) {
     }
 
     CM_Init();
+    GB_Init();
 
     // ── Main loop ─────────────────────────────
     u32 pollTickNs = g_cheats.pollIntervalMs * 1000000u;
@@ -227,8 +229,8 @@ static void pluginThread(void *arg) {
         }
 
         if (CM_IsVisible()) {
-            CM_HandleInput(kDown, kHeld);
-            CM_Draw();
+            GB_HandleInput(kDown, kHeld);
+            GB_Draw();
         }
 
         // Re-apply all enabled cheats every tick — this is what makes
@@ -238,6 +240,8 @@ static void pluginThread(void *arg) {
 
         svcSleepThread((s64)pollTickNs);
     }
+
+    GB_Exit();
 
     // Persist final toggle state on the way out
     if (g_cheats.db.loaded) {

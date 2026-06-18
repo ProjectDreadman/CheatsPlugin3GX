@@ -110,10 +110,12 @@ Result CC_LoadDatabase(u64 titleId) {
         CC_Log("[CC] No cheat file found at %s", path);
         g_cheats.db.titleId = titleId;
         g_cheats.db.loaded  = false;
+        strncpy(g_cheats.db.sourcePath, path, CC_MAX_PATH - 1);
         return -1;
     }
 
     g_cheats.db.titleId = titleId;
+    strncpy(g_cheats.db.sourcePath, path, CC_MAX_PATH - 1);
 
     u32 errorCount = 0;
     for (u32 i = 0; i < g_cheats.db.cheatCount; i++) {
@@ -125,14 +127,137 @@ Result CC_LoadDatabase(u64 titleId) {
            (unsigned long)errorCount,
            (unsigned long long)titleId);
 
+    CC_RebuildCategoryIndex();
+
     // Restore any previously saved enable/disable state
     CC_LoadState(titleId);
+    CC_RebuildCategoryIndex(); // enabled counts changed after restoring state
 
     return 0;
 }
 
 void CC_UnloadDatabase(void) {
     memset(&g_cheats.db, 0, sizeof(g_cheats.db));
+}
+
+// ─────────────────────────────────────────────
+//  Reload — re-parse the same file on disk without restarting the game.
+//  This is what makes cheat editing "dynamic": a user can edit
+//  sdmc:/cheats/<titleid>.txt on a PC, swap the SD card back in (or use
+//  a USB SD adapter / FTP tool that doesn't require ejecting), and pull
+//  the changes in live via the overlay's "Reload" action.
+//
+//  Currently-enabled cheats are preserved across reload by name where
+//  possible: we snapshot which names were enabled, re-parse, then
+//  re-apply that enabled set to whichever entries still exist under the
+//  same name. Cheats removed from the file are simply gone; cheats
+//  added are loaded disabled by default (consistent with first load).
+// ─────────────────────────────────────────────
+Result CC_ReloadDatabase(void) {
+    if (g_cheats.db.sourcePath[0] == '\0') {
+        CC_Log("[CC] Reload requested but no source path is known yet");
+        return -1;
+    }
+
+    // Snapshot currently-enabled names
+    char enabledNames[CC_MAX_CHEATS][CC_MAX_NAME];
+    u32  enabledCount = 0;
+    for (u32 i = 0; i < g_cheats.db.cheatCount && enabledCount < CC_MAX_CHEATS; i++) {
+        if (g_cheats.db.cheats[i].enabled) {
+            strncpy(enabledNames[enabledCount], g_cheats.db.cheats[i].name, CC_MAX_NAME - 1);
+            enabledNames[enabledCount][CC_MAX_NAME - 1] = '\0';
+            enabledCount++;
+        }
+    }
+
+    u64  titleId = g_cheats.db.titleId;
+    char savedPath[CC_MAX_PATH];
+    strncpy(savedPath, g_cheats.db.sourcePath, CC_MAX_PATH - 1);
+    savedPath[CC_MAX_PATH - 1] = '\0';
+
+    CheatDatabase fresh;
+    if (CP_ParseFile(savedPath, &fresh) != 0) {
+        CC_Log("[CC] Reload failed: could not re-read %s", savedPath);
+        return -1;
+    }
+
+    fresh.titleId = titleId;
+    strncpy(fresh.sourcePath, savedPath, CC_MAX_PATH - 1);
+
+    // Re-apply the enabled snapshot by name
+    u32 restored = 0;
+    for (u32 i = 0; i < fresh.cheatCount; i++) {
+        for (u32 j = 0; j < enabledCount; j++) {
+            if (strcmp(fresh.cheats[i].name, enabledNames[j]) == 0) {
+                if (!fresh.cheats[i].hasError) {
+                    fresh.cheats[i].enabled = true;
+                    restored++;
+                }
+                break;
+            }
+        }
+    }
+
+    g_cheats.db = fresh;
+    CC_RebuildCategoryIndex();
+
+    CC_Log("[CC] Reloaded %lu cheats from %s (%lu re-enabled from previous session)",
+           (unsigned long)g_cheats.db.cheatCount, savedPath, (unsigned long)restored);
+
+    CC_SaveState(titleId);
+    return 0;
+}
+
+// ─────────────────────────────────────────────
+//  Category index
+//
+//  Builds the deduplicated category list from the current cheats[]
+//  array and assigns each cheat's categoryIndex. Cheats with an empty
+//  category string are left at categoryIndex = -1 and shown under the
+//  menu's built-in "Uncategorized" bucket rather than a real entry,
+//  so a cheat file with no categories at all doesn't show a stray
+//  empty-named category.
+// ─────────────────────────────────────────────
+void CC_RebuildCategoryIndex(void) {
+    CheatDatabase *db = &g_cheats.db;
+    db->categoryCount = 0;
+    memset(db->categories, 0, sizeof(db->categories));
+
+    for (u32 i = 0; i < db->cheatCount; i++) {
+        Cheat *c = &db->cheats[i];
+
+        if (c->category[0] == '\0') {
+            c->categoryIndex = -1;
+            continue;
+        }
+
+        // Find existing category (case-insensitive match)
+        s32 foundIdx = -1;
+        for (u32 k = 0; k < db->categoryCount; k++) {
+            if (strcasecmp(db->categories[k].name, c->category) == 0) {
+                foundIdx = (s32)k;
+                break;
+            }
+        }
+
+        if (foundIdx < 0) {
+            if (db->categoryCount >= CC_MAX_CATEGORIES) {
+                // Category table full — fall back to uncategorized rather
+                // than overflow; still searchable via the full list.
+                c->categoryIndex = -1;
+                continue;
+            }
+            foundIdx = (s32)db->categoryCount;
+            strncpy(db->categories[foundIdx].name, c->category, CC_MAX_CATEGORY - 1);
+            db->categoryCount++;
+        }
+
+        c->categoryIndex = foundIdx;
+        db->categories[foundIdx].cheatCount++;
+        if (c->enabled) db->categories[foundIdx].enabledCount++;
+    }
+
+    CC_Log("[CC] Category index rebuilt: %lu categories", (unsigned long)db->categoryCount);
 }
 
 // ─────────────────────────────────────────────
@@ -202,6 +327,14 @@ void CC_ToggleCheat(u32 index) {
     c->enabled = !c->enabled;
     CC_Log("[CC] Cheat \"%s\" %s", c->name, c->enabled ? "ENABLED" : "disabled");
 
+    // Keep the cached per-category enabled count in sync rather than
+    // re-scanning every cheat on every toggle.
+    if (c->categoryIndex >= 0 && (u32)c->categoryIndex < g_cheats.db.categoryCount) {
+        CheatCategory *cat = &g_cheats.db.categories[c->categoryIndex];
+        if (c->enabled) cat->enabledCount++;
+        else if (cat->enabledCount > 0) cat->enabledCount--;
+    }
+
     // Persist immediately so a crash/reset doesn't lose the change
     CC_SaveState(g_cheats.db.titleId);
 }
@@ -227,6 +360,10 @@ void CC_ApplyEnabledCheats(void) {
         // automatically rather than spamming bounds errors every tick.
         if (res == VM_ERR_BOUNDS) {
             c->enabled = false;
+            if (c->categoryIndex >= 0 && (u32)c->categoryIndex < g_cheats.db.categoryCount) {
+                CheatCategory *cat = &g_cheats.db.categories[c->categoryIndex];
+                if (cat->enabledCount > 0) cat->enabledCount--;
+            }
             CC_Log("[CC] \"%s\" auto-disabled: target address out of bounds", c->name);
         }
     }

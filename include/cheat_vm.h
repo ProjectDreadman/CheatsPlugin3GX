@@ -18,8 +18,11 @@
 //    5XXXXXXX YYYYYYYY   16-bit if-equal
 //    6XXXXXXX YYYYYYYY   16-bit if-not-equal
 //    8XXXXXXX YYYYYYYY   32-bit add to memory:  *(u32*)(base+X) += Y
-//    9XXXXXXX 000000NN   repeat NN times, advancing address by 4 each time,
-//                        applying the next code line's write
+//    94000130 YYYYZZZZ   "if button held" gate (Gateway pad-gate convention):
+//                        YYYY = required-held mask, ZZZZ = required-not-held mask
+//                        (this is the ONLY 0x9-nibble form implemented —
+//                        a generic 9XXXXXXX "repeat" opcode is NOT supported
+//                        and will be flagged as unsupported by CVM_Validate)
 //    A0000000 NNNNNNNN   load offset register = NNNNNNNN
 //    B0000000 00000000   end-if / pop conditional block
 //    C0000000 NNNNNNNN   loop start, repeat following block NNNNNNNN times
@@ -27,8 +30,6 @@
 //    D2000000 00000000   terminator / end of cheat (no-op marker)
 //    D3000000 XXXXXXXX   set base address register = XXXXXXXX (module base)
 //    D4000000 NNNNNNNN   delay NNNNNNNN ms before next line (clamped)
-//    94000130 YYYYZZZZ   "if button held" gate (Gateway pad-gate convention):
-//                        YYYY = required-held mask, ZZZZ = required-not-held mask
 //
 //  This is a pragmatic subset covering the opcodes that appear in the vast
 //  majority of real-world community cheat databases. Anything unrecognised

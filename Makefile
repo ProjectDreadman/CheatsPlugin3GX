@@ -7,8 +7,14 @@
 #    · Luma3DS plugin SDK linker script (3gx.ld) installed alongside libctru
 #
 #  Build:
-#    make          → CustomCheats.3gx
-#    make clean    → remove build artefacts
+#    make                    → CustomCheats.3gx  (framebuffer GUI only)
+#    make ENABLE_CITRO2D=1   → also compiles and links the experimental
+#                              Citro2D GUI backend (requires citro2d +
+#                              citro3d to be installed; pacman -S
+#                              3ds-citro2d 3ds-citro3d). Off by default —
+#                              see README.md "Graphical Interface" before
+#                              enabling this in a build you distribute.
+#    make clean              → remove build artefacts
 #    make install SD_MOUNT=/path/to/sdcard
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -24,6 +30,8 @@ BUILD    := build
 SOURCES  := source
 INCLUDES := include $(DEVKITPRO)/libctru/include
 DATA     := data
+
+ENABLE_CITRO2D ?= 0
 
 PREFIX   := $(DEVKITARM)/bin/arm-none-eabi-
 CC       := $(PREFIX)gcc
@@ -50,7 +58,25 @@ LDFLAGS  := $(ARCH) \
 
 LIBS     := -lctru -lm
 
-CFILES   := $(wildcard $(SOURCES)/*.c)
+# ─────────────────────────────────────────────
+#  Source discovery
+#
+#  gui_citro2d.c is the ONLY file excluded from the build by default —
+#  it #includes <citro2d.h>/<citro3d.h>, which most people building just
+#  the framebuffer GUI won't have installed. Every other source file
+#  (including the always-present gui_backend.c selector) is picked up
+#  automatically via the wildcard below.
+# ─────────────────────────────────────────────
+ALL_CFILES := $(wildcard $(SOURCES)/*.c)
+
+ifeq ($(ENABLE_CITRO2D),1)
+  CFILES   := $(ALL_CFILES)
+  CFLAGS   += -DCC_ENABLE_CITRO2D -I$(DEVKITPRO)/libctru/include
+  LIBS     := -lcitro2d -lcitro3d $(LIBS)
+else
+  CFILES   := $(filter-out $(SOURCES)/gui_citro2d.c,$(ALL_CFILES))
+endif
+
 OBJS     := $(patsubst $(SOURCES)/%.c,$(BUILD)/%.o,$(CFILES))
 
 .PHONY: all clean install
@@ -75,7 +101,7 @@ $(TARGET).3gx: $(BUILD)/$(TARGET).elf
 	    --strip-unneeded \
 	    -O binary \
 	    $< $@
-	@echo "  Built: $(TARGET).3gx"
+	@echo "  Built: $(TARGET).3gx  (ENABLE_CITRO2D=$(ENABLE_CITRO2D))"
 	@ls -lh $(TARGET).3gx
 
 clean:

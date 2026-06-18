@@ -148,7 +148,8 @@ int CP_ParseFile(const char *path, CheatDatabase *db) {
 
             cur = &db->cheats[db->cheatCount++];
             memset(cur, 0, sizeof(*cur));
-            cur->enabled = false;
+            cur->enabled       = false;
+            cur->categoryIndex = -1;
 
             // Outer header text is everything between the FIRST '[' and
             // the matching LAST ']' on the line.

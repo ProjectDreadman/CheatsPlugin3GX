@@ -31,6 +31,7 @@
 #define CC_MAX_NOTE          128
 #define CC_MAX_PATH          256
 #define CC_MAX_CATEGORY      32
+#define CC_MAX_CATEGORIES    32      // distinct categories per game
 
 // ─────────────────────────────────────────────
 //  Paths
@@ -62,17 +63,32 @@ typedef struct {
     bool           enabled;          // current toggle state
     bool           isOneShot;        // codes with only D-type one-time writes
     bool           hasError;         // failed to parse / unsupported opcode
+    s32            categoryIndex;    // index into CheatDatabase.categories, -1 = "Uncategorized"
 } Cheat;
+
+// ─────────────────────────────────────────────
+//  A distinct category, with a running count of how many of its
+//  cheats are currently enabled (kept in sync by the engine so the
+//  menu can show "Combat (2/5)" without re-scanning every cheat).
+// ─────────────────────────────────────────────
+typedef struct {
+    char name[CC_MAX_CATEGORY];
+    u32  cheatCount;
+    u32  enabledCount;
+} CheatCategory;
 
 // ─────────────────────────────────────────────
 //  Per-game cheat database
 // ─────────────────────────────────────────────
 typedef struct {
-    u64    titleId;
-    char   gameName[CC_MAX_NAME];   // optional, from file header comment
-    Cheat  cheats[CC_MAX_CHEATS];
-    u32    cheatCount;
-    bool   loaded;
+    u64           titleId;
+    char          gameName[CC_MAX_NAME];   // optional, from file header comment
+    Cheat         cheats[CC_MAX_CHEATS];
+    u32           cheatCount;
+    CheatCategory categories[CC_MAX_CATEGORIES];
+    u32           categoryCount;
+    bool          loaded;
+    char          sourcePath[CC_MAX_PATH]; // remembered for CC_ReloadDatabase()
 } CheatDatabase;
 
 // ─────────────────────────────────────────────
@@ -97,6 +113,9 @@ Result CC_ReadConfig(void);
 
 Result CC_LoadDatabase(u64 titleId);
 void   CC_UnloadDatabase(void);
+Result CC_ReloadDatabase(void);       // re-parse sourcePath without restarting the game
+
+void   CC_RebuildCategoryIndex(void); // recompute g_cheats.db.categories[] from current cheats[]
 
 Result CC_LoadState(u64 titleId);     // restore enabled/disabled per cheat
 Result CC_SaveState(u64 titleId);     // persist toggle state across sessions
