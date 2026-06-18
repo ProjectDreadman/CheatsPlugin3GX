@@ -203,8 +203,8 @@ gui_backend_citro2d = false
 bash <(curl -sSL https://pkg.devkitpro.org/installer/linux)
 dkp-pacman -S 3ds-dev
 
-git clone https://github.com/yourname/CustomCheats3GX
-cd CustomCheats3GX
+git clone https://github.com/ProjectDreadman/CheatsPlugin3GX
+cd CheatsPlugin3GX
 make
 make install SD_MOUNT=/media/youruser/SDCARD
 ```
